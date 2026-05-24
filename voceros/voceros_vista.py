@@ -1,148 +1,322 @@
+"""
+voceros/voceros_vista.py – Vocería y Representantes.
+Tabla con filtros y modal de registro de representante.
+"""
 import customtkinter as ctk
-from tkinter import ttk
-from config.style import *
-from voceros.voceros_controlador import VocerosControlador
+from tkinter import ttk, messagebox
+from datetime import date
+from config.style import COLORS, FONTS, PADDING, CORNER_RADIUS, aplicar_estilo_tabla
+from voceros.voceros_modelo import VocerosModelo, Representante, Cargo
+from config.database import SessionLocal, remove_db
+from config.auth_session import AuthSession
+from bitacora.bitacora_modelo import BitacoraModelo
+
 
 class VocerosVista(ctk.CTkFrame):
-    def __init__(self, parent):
-        super().__init__(parent, fg_color="transparent")
-        self.pack(fill="both", expand=True)
-        self.controlador = VocerosControlador(self)
-        self.id_seleccionado = None
-        
-        self.setup_ui()
-        self.controlador.cargar_datos()
+    def __init__(self, master, **kwargs):
+        super().__init__(master, fg_color="transparent", **kwargs)
+        self.pack(fill="both", expand=True, padx=PADDING["lg"], pady=PADDING["lg"])
+        aplicar_estilo_tabla()
+        self.modelo = VocerosModelo()
+        self._build_ui()
+        self._cargar_datos()
 
-    def setup_ui(self):
-        # Título
-        lbl_titulo = ctk.CTkLabel(self, text="Gestión de Voceros", font=FUENTE_TITULO, text_color=COLOR_TEXTO)
-        lbl_titulo.pack(pady=(0, 20), anchor="w")
+    def _build_ui(self):
+        # Encabezado
+        hdr = ctk.CTkFrame(self, fg_color="transparent")
+        hdr.pack(fill="x", pady=(0, PADDING["lg"]))
 
-        # Top bar (Búsqueda y Formulario)
-        top_frame = ctk.CTkFrame(self, fg_color="transparent")
-        top_frame.pack(fill="x", pady=(0, 20))
+        ctk.CTkLabel(hdr, text="Voceria y Representantes",
+                     font=FONTS["display_lg"], text_color=COLORS["neutral"]).pack(side="left")
 
-        # Formulario
-        form_frame = ctk.CTkFrame(top_frame, fg_color=COLOR_SIDEBAR)
-        form_frame.pack(side="left", fill="both", expand=True, padx=(0, 20))
+        ctk.CTkButton(
+            hdr, text="+ Registrar Representante",
+            fg_color=COLORS["primary"], hover_color=COLORS["primary_container"],
+            text_color=COLORS["on_primary"], font=FONTS["body_bold"],
+            height=40, corner_radius=CORNER_RADIUS["button"],
+            command=self._abrir_modal,
+        ).pack(side="right")
 
-        self.txt_id_habitante = ctk.CTkEntry(form_frame, placeholder_text="ID Habitante", font=FUENTE_CUERPO)
-        self.txt_id_habitante.grid(row=0, column=0, padx=10, pady=10, sticky="ew")
+        # KPIs rápidos
+        kpi_row = ctk.CTkFrame(self, fg_color="transparent")
+        kpi_row.pack(fill="x", pady=(0, PADDING["md"]))
+        self._lbl_activos = self._kpi_chip(kpi_row, "Voceros Activos", "0", COLORS["tertiary"])
+        self._lbl_inactivos = self._kpi_chip(kpi_row, "Inactivos", "0", COLORS["on_surface_variant"])
 
-        self.txt_id_cargo = ctk.CTkEntry(form_frame, placeholder_text="ID Cargo", font=FUENTE_CUERPO)
-        self.txt_id_cargo.grid(row=0, column=1, padx=10, pady=10, sticky="ew")
+        # Filtro
+        filtro = ctk.CTkFrame(self, fg_color=COLORS["surface_high"],
+                              corner_radius=CORNER_RADIUS["input"])
+        filtro.pack(fill="x", pady=(0, PADDING["md"]))
 
-        self.cmb_tipo = ctk.CTkComboBox(form_frame, values=["P", "S"], font=FUENTE_CUERPO) # P=Principal, S=Suplente
-        self.cmb_tipo.grid(row=0, column=2, padx=10, pady=10, sticky="ew")
+        self.txt_busqueda = ctk.CTkEntry(
+            filtro, placeholder_text="Buscar por nombre o cargo...",
+            height=40, font=FONTS["body_base"], fg_color="transparent", border_width=0,
+        )
+        self.txt_busqueda.pack(side="left", fill="x", expand=True, padx=12)
+        self.txt_busqueda.bind("<Return>", lambda e: self._cargar_datos())
 
-        self.txt_fecha_inicio = ctk.CTkEntry(form_frame, placeholder_text="Fecha Inicio (DD/MM/AAAA)", font=FUENTE_CUERPO)
-        self.txt_fecha_inicio.grid(row=1, column=0, padx=10, pady=10, sticky="ew")
+        ctk.CTkLabel(filtro, text="Estado:", font=FONTS["body_bold"],
+                     text_color=COLORS["neutral"]).pack(side="left", padx=(0, 4))
+        self.opt_estado = ctk.CTkOptionMenu(
+            filtro, values=["Todos", "activo", "inactivo"],
+            width=120, font=FONTS["body_base"],
+            fg_color=COLORS["primary"], button_color=COLORS["primary_container"],
+            text_color=COLORS["on_primary"],
+            command=lambda _: self._cargar_datos(),
+        )
+        self.opt_estado.pack(side="left", padx=8, pady=8)
 
-        self.txt_fecha_fin = ctk.CTkEntry(form_frame, placeholder_text="Fecha Fin (DD/MM/AAAA)", font=FUENTE_CUERPO)
-        self.txt_fecha_fin.grid(row=1, column=1, padx=10, pady=10, sticky="ew")
+        ctk.CTkButton(
+            filtro, text="Buscar", width=90, height=36,
+            fg_color=COLORS["primary"], text_color=COLORS["on_primary"],
+            hover_color=COLORS["primary_container"], font=FONTS["body_bold"],
+            corner_radius=CORNER_RADIUS["button"],
+            command=self._cargar_datos,
+        ).pack(side="right", padx=8)
 
-        for i in range(3):
-            form_frame.grid_columnconfigure(i, weight=1)
+        # Tabla
+        card = ctk.CTkFrame(
+            self, fg_color=COLORS["surface_lowest"],
+            corner_radius=CORNER_RADIUS["card"],
+            border_width=1, border_color=COLORS["outline_variant"],
+        )
+        card.pack(fill="both", expand=True)
 
-        # Botones Formulario
-        btn_frame = ctk.CTkFrame(top_frame, fg_color="transparent")
-        btn_frame.pack(side="right", fill="y")
+        hdr2 = ctk.CTkFrame(card, fg_color="transparent")
+        hdr2.pack(fill="x", padx=16, pady=(12, 4))
+        ctk.CTkLabel(hdr2, text="Directiva Comunal",
+                     font=FONTS["headline_sm"], text_color=COLORS["neutral"]).pack(side="left")
+        self.lbl_conteo = ctk.CTkLabel(hdr2, text="",
+                                       font=FONTS["helper_text"],
+                                       text_color=COLORS["on_surface_variant"])
+        self.lbl_conteo.pack(side="right")
 
-        self.btn_guardar = ctk.CTkButton(btn_frame, text="Guardar", fg_color=COLOR_ACENTO, hover_color=COLOR_HOVER, command=self.guardar)
-        self.btn_guardar.pack(pady=(0, 10))
+        ctk.CTkFrame(card, height=1, fg_color=COLORS["outline_variant"]).pack(fill="x")
 
-        self.btn_eliminar = ctk.CTkButton(btn_frame, text="Eliminar", fg_color=COLOR_ERROR, hover_color="#B71C1C", command=self.eliminar, state="disabled")
-        self.btn_eliminar.pack(pady=(0, 10))
+        cols = ("ID", "Nombre Completo", "Cargo", "Tipo", "F. Inicio", "F. Fin", "Estado")
+        self.tabla = ttk.Treeview(card, columns=cols, show="headings", style="CF.Treeview")
+        anchos = {"ID": 50, "Nombre Completo": 220, "Cargo": 180,
+                  "Tipo": 90, "F. Inicio": 100, "F. Fin": 100, "Estado": 90}
+        for col in cols:
+            self.tabla.heading(col, text=col)
+            self.tabla.column(col,
+                             anchor="w" if col == "Nombre Completo" else "center",
+                             width=anchos[col])
 
-        self.btn_limpiar = ctk.CTkButton(btn_frame, text="Limpiar", fg_color="#757575", hover_color="#616161", command=self.limpiar_formulario)
-        self.btn_limpiar.pack()
+        sb = ttk.Scrollbar(card, orient="vertical", command=self.tabla.yview)
+        self.tabla.configure(yscrollcommand=sb.set)
+        self.tabla.pack(side="left", fill="both", expand=True, padx=16, pady=8)
+        sb.pack(side="right", fill="y", pady=8, padx=(0, 8))
 
-        # Barra de búsqueda
-        search_frame = ctk.CTkFrame(self, fg_color="transparent")
-        search_frame.pack(fill="x", pady=(0, 10))
-        
-        self.txt_buscar = ctk.CTkEntry(search_frame, placeholder_text="Buscar por Habitante o Cargo...", font=FUENTE_CUERPO)
-        self.txt_buscar.pack(side="left", fill="x", expand=True, padx=(0, 10))
-        
-        btn_buscar = ctk.CTkButton(search_frame, text="Buscar", fg_color=COLOR_ACENTO, hover_color=COLOR_HOVER, width=100, command=lambda: self.controlador.cargar_datos(self.txt_buscar.get()))
-        btn_buscar.pack(side="right")
+        self.tabla.tag_configure("activo",   foreground=COLORS["tertiary"])
+        self.tabla.tag_configure("inactivo", foreground=COLORS["on_surface_variant"])
 
-        # Tabla (Treeview)
-        style = ttk.Style()
-        style.theme_use("default")
-        style.configure("Treeview.Heading", font=FUENTE_SUBTITULO, background=COLOR_SIDEBAR, foreground=COLOR_TEXTO)
-        style.configure("Treeview", font=FUENTE_CUERPO, rowheight=30, background=COLOR_CONTENIDO, foreground=COLOR_TEXTO, fieldbackground=COLOR_CONTENIDO)
-        style.map("Treeview", background=[("selected", COLOR_ACENTO)])
+    def _kpi_chip(self, parent, titulo, valor, color):
+        chip = ctk.CTkFrame(parent, fg_color=COLORS["surface_lowest"],
+                            corner_radius=CORNER_RADIUS["card"],
+                            border_width=1, border_color=COLORS["outline_variant"])
+        chip.pack(side="left", padx=(0, 10), ipadx=12, ipady=6)
+        ctk.CTkLabel(chip, text=titulo, font=FONTS["label_caps"],
+                     text_color=COLORS["on_surface_variant"]).pack(side="left", padx=(10, 6))
+        lbl = ctk.CTkLabel(chip, text=valor, font=FONTS["body_bold"], text_color=color)
+        lbl.pack(side="left", padx=(0, 10))
+        return lbl
 
-        columns = ("ID", "Habitante", "Cargo", "Tipo", "Fecha Inicio", "Fecha Fin", "ID Hab", "ID Car")
-        self.tree = ttk.Treeview(self, columns=columns, show="headings")
-        
-        for col in columns:
-            self.tree.heading(col, text=col)
-            self.tree.column(col, anchor="w")
-        self.tree.column("ID", width=30)
-        self.tree.column("ID Hab", width=0, stretch=False)
-        self.tree.column("ID Car", width=0, stretch=False)
-        
-        self.tree.pack(fill="both", expand=True)
-        self.tree.bind("<<TreeviewSelect>>", self.seleccionar_registro)
-        
-        self.lbl_mensaje = ctk.CTkLabel(self, text="", font=FUENTE_CUERPO)
-        self.lbl_mensaje.pack(pady=5)
+    def _cargar_datos(self):
+        busqueda  = self.txt_busqueda.get().strip().lower()
+        estado_f  = self.opt_estado.get()
 
-    def mostrar_datos(self, datos):
-        for item in self.tree.get_children():
-            self.tree.delete(item)
-        for row in datos:
-            self.tree.insert("", "end", values=row)
+        db = SessionLocal()
+        try:
+            query = db.query(Representante)
+            if estado_f != "Todos":
+                query = query.filter(Representante.estado == estado_f)
+            reps = query.limit(500).all()
 
-    def seleccionar_registro(self, event):
-        seleccion = self.tree.selection()
-        if seleccion:
-            item = self.tree.item(seleccion[0])['values']
-            self.id_seleccionado = item[0]
-            self.limpiar_entradas()
-            self.txt_id_habitante.insert(0, item[6] if item[6] != "None" else "")
-            self.txt_id_cargo.insert(0, item[7] if item[7] != "None" else "")
-            self.cmb_tipo.set(item[3] if item[3] != "None" else "P")
-            self.txt_fecha_inicio.insert(0, item[4] if item[4] != "None" else "")
-            self.txt_fecha_fin.insert(0, item[5] if item[5] != "None" else "")
-            self.btn_eliminar.configure(state="normal")
+            data = []
+            for r in reps:
+                nombre = f"{r.habitante.nombres} {r.habitante.apellidos}" if r.habitante else "—"
+                cargo  = r.cargo.nombre if r.cargo else "—"
+                data.append({
+                    "id":      r.id_representante,
+                    "nombre":  nombre,
+                    "cargo":   cargo,
+                    "tipo":    r.tipo or "—",
+                    "inicio":  str(r.fecha_inicio) if r.fecha_inicio else "—",
+                    "fin":     str(r.fecha_fin) if r.fecha_fin else "—",
+                    "estado":  r.estado,
+                })
+        finally:
+            remove_db()
 
-    def limpiar_entradas(self):
-        self.txt_id_habitante.delete(0, 'end')
-        self.txt_id_cargo.delete(0, 'end')
-        self.txt_fecha_inicio.delete(0, 'end')
-        self.txt_fecha_fin.delete(0, 'end')
+        if busqueda:
+            data = [d for d in data if
+                    busqueda in d["nombre"].lower() or
+                    busqueda in d["cargo"].lower()]
 
-    def limpiar_formulario(self):
-        self.id_seleccionado = None
-        self.limpiar_entradas()
-        self.btn_eliminar.configure(state="disabled")
-        self.txt_buscar.delete(0, 'end')
-        self.lbl_mensaje.configure(text="")
-        self.controlador.cargar_datos()
+        activos   = sum(1 for d in data if d["estado"] == "activo")
+        inactivos = sum(1 for d in data if d["estado"] == "inactivo")
+        self._lbl_activos.configure(text=str(activos))
+        self._lbl_inactivos.configure(text=str(inactivos))
+        self.lbl_conteo.configure(text=f"{len(data)} registros")
 
-    def guardar(self):
-        id_hab = self.txt_id_habitante.get()
-        id_car = self.txt_id_cargo.get()
-        if not id_hab.isdigit() or not id_car.isdigit():
-            self.mostrar_mensaje("Error", "IDs deben ser numéricos")
+        for item in self.tabla.get_children():
+            self.tabla.delete(item)
+        for d in data:
+            tag = d["estado"]
+            self.tabla.insert("", "end", values=(
+                d["id"], d["nombre"], d["cargo"], d["tipo"],
+                d["inicio"], d["fin"], d["estado"],
+            ), tags=(tag,))
+
+    def _abrir_modal(self):
+        dlg = _ModalRepresentante(self, on_guardar=self._cargar_datos)
+        dlg.grab_set()
+
+
+# ─── Modal Representante ──────────────────────────────────────────────────────
+class _ModalRepresentante(ctk.CTkToplevel):
+    def __init__(self, parent, on_guardar=None):
+        super().__init__(parent)
+        self.title("Registrar Representante")
+        self.geometry("540x540")
+        self.configure(fg_color=COLORS["surface_lowest"])
+        self.on_guardar = on_guardar
+        self.modelo = VocerosModelo()
+        self._habitante_id = None
+        self._cargos: list[Cargo] = []
+        self._build_ui()
+        self._cargar_cargos()
+
+    def _build_ui(self):
+        inner = ctk.CTkFrame(self, fg_color="transparent")
+        inner.pack(fill="both", expand=True, padx=32, pady=24)
+
+        ctk.CTkLabel(inner, text="Nuevo Representante",
+                     font=FONTS["headline_sm"], text_color=COLORS["neutral"]).pack(pady=(0, 20))
+
+        # Buscar habitante
+        ctk.CTkLabel(inner, text="Buscar Habitante (nombre o cedula) *",
+                     font=FONTS["body_bold"], text_color=COLORS["neutral"]).pack(anchor="w")
+        row_h = ctk.CTkFrame(inner, fg_color="transparent")
+        row_h.pack(fill="x", pady=(4, 4))
+
+        self.txt_habitante = ctk.CTkEntry(row_h, height=40, font=FONTS["body_base"],
+                                          corner_radius=CORNER_RADIUS["input"],
+                                          border_color=COLORS["outline_variant"])
+        self.txt_habitante.pack(side="left", fill="x", expand=True)
+
+        ctk.CTkButton(
+            row_h, text="Buscar", width=80, height=40,
+            fg_color=COLORS["primary"], text_color=COLORS["on_primary"],
+            hover_color=COLORS["primary_container"], font=FONTS["body_bold"],
+            corner_radius=CORNER_RADIUS["button"],
+            command=self._buscar_habitante,
+        ).pack(side="right", padx=(8, 0))
+
+        self.lbl_habitante_sel = ctk.CTkLabel(
+            inner, text="Ninguno seleccionado",
+            font=FONTS["helper_text"], text_color=COLORS["on_surface_variant"],
+        )
+        self.lbl_habitante_sel.pack(anchor="w", pady=(2, 12))
+
+        # Cargo
+        ctk.CTkLabel(inner, text="Cargo *", font=FONTS["body_bold"],
+                     text_color=COLORS["neutral"]).pack(anchor="w")
+        self.opt_cargo = ctk.CTkOptionMenu(
+            inner, values=["Cargando..."],
+            fg_color=COLORS["primary"], button_color=COLORS["primary_container"],
+            text_color=COLORS["on_primary"], font=FONTS["body_base"],
+        )
+        self.opt_cargo.pack(fill="x", pady=(4, 12))
+
+        # Tipo
+        ctk.CTkLabel(inner, text="Tipo *", font=FONTS["body_bold"],
+                     text_color=COLORS["neutral"]).pack(anchor="w")
+        self.opt_tipo = ctk.CTkOptionMenu(
+            inner, values=["Vocero", "Miembro"],
+            fg_color=COLORS["primary"], button_color=COLORS["primary_container"],
+            text_color=COLORS["on_primary"], font=FONTS["body_base"],
+        )
+        self.opt_tipo.pack(fill="x", pady=(4, 12))
+
+        # Fecha inicio
+        ctk.CTkLabel(inner, text="Fecha Inicio (AAAA-MM-DD) *",
+                     font=FONTS["body_bold"], text_color=COLORS["neutral"]).pack(anchor="w")
+        self.txt_inicio = ctk.CTkEntry(inner, height=40, font=FONTS["body_base"],
+                                       corner_radius=CORNER_RADIUS["input"],
+                                       border_color=COLORS["outline_variant"])
+        self.txt_inicio.insert(0, str(date.today()))
+        self.txt_inicio.pack(fill="x", pady=(4, 12))
+
+        self.lbl_err = ctk.CTkLabel(inner, text="", text_color=COLORS["error"],
+                                    font=FONTS["helper_text"])
+        self.lbl_err.pack()
+
+        ctk.CTkButton(
+            inner, text="Registrar",
+            fg_color=COLORS["primary"], hover_color=COLORS["primary_container"],
+            text_color=COLORS["on_primary"], font=FONTS["body_bold"],
+            height=44, corner_radius=CORNER_RADIUS["button"],
+            command=self._guardar,
+        ).pack(fill="x", pady=(12, 0))
+
+    def _cargar_cargos(self):
+        db = SessionLocal()
+        try:
+            self._cargos = db.query(Cargo).all()
+            nombres = [c.nombre for c in self._cargos] or ["Sin cargos"]
+            self._cargos_map = {c.nombre: c.id_cargo for c in self._cargos}
+        finally:
+            remove_db()
+        self.opt_cargo.configure(values=nombres)
+        if nombres:
+            self.opt_cargo.set(nombres[0])
+
+    def _buscar_habitante(self):
+        busqueda = self.txt_habitante.get().strip()
+        if not busqueda:
             return
-
-        self.controlador.guardar(
-            self.id_seleccionado,
-            int(id_hab),
-            int(id_car),
-            self.cmb_tipo.get(),
-            self.txt_fecha_inicio.get(),
-            self.txt_fecha_fin.get()
+        from habitantes.habitantes_modelo import HabitantesModelo
+        modelo = HabitantesModelo()
+        res = modelo.obtener_todos(busqueda=busqueda)
+        if not res:
+            self.lbl_habitante_sel.configure(
+                text="No encontrado.", text_color=COLORS["error"])
+            return
+        h = res[0]
+        self._habitante_id = h["id_habitante"]
+        self.lbl_habitante_sel.configure(
+            text=f"✓ {h['nombres']} {h['apellidos']} (CI: {h['cedula'] or '—'})",
+            text_color=COLORS["tertiary"],
         )
 
-    def eliminar(self):
-        if self.id_seleccionado:
-            self.controlador.eliminar(self.id_seleccionado)
+    def _guardar(self):
+        if not self._habitante_id:
+            self.lbl_err.configure(text="Debe seleccionar un habitante.")
+            return
+        cargo_nombre = self.opt_cargo.get()
+        cargo_id = self._cargos_map.get(cargo_nombre)
+        if not cargo_id:
+            self.lbl_err.configure(text="Cargo no valido.")
+            return
+        try:
+            f_inicio = date.fromisoformat(self.txt_inicio.get().strip())
+        except ValueError:
+            self.lbl_err.configure(text="Fecha invalida (AAAA-MM-DD).")
+            return
 
-    def mostrar_mensaje(self, titulo, mensaje):
-        color = COLOR_EXITO if titulo == "Éxito" else COLOR_ERROR
-        self.lbl_mensaje.configure(text=mensaje, text_color=color)
+        datos = {
+            "habitante_id": self._habitante_id,
+            "cargo_id":     cargo_id,
+            "tipo":         self.opt_tipo.get(),
+            "fecha_inicio": f_inicio,
+            "estado":       "activo",
+        }
+        ok, msg = self.modelo.crear_representante(datos)
+        if ok:
+            if self.on_guardar:
+                self.on_guardar()
+            self.destroy()
+        else:
+            self.lbl_err.configure(text=msg)
